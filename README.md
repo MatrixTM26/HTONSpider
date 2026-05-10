@@ -2,6 +2,13 @@
 
 A networking toolkit for analize, trace, and filter active proxies
 
+### Installation and Usage
+
+```bash
+git clone https://github.com/MatrixTM26/HTONSpider.git
+cd HTONSpider
+```
+
 ### Compile
 
 ```bash
