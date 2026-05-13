@@ -109,7 +109,9 @@ static void PrintMainHelp(const char *P) {
     printf("  %s%sifinfo%s   Interfaces: IP/mask/MTU/flags/MAC/TX/RX/errors\n",         BD, CBlue,  CR);
     printf("  %s%sbanner%s   Raw TCP/UDP banner grab, hex dump, custom payload\n",       BD, CGreen,  CR);
     printf("  %s%ssubnet%s   Subnet calc: range, broadcast, wildcard, class, CIDR\n",   BD, CWhite, CR);
-    printf("  %s%sip%s       Public IP info, GeoIP, ASN, org, timezone\n\n",            BD, CBlue,  CR);
+    printf("  %s%sip%s       Public IP info, GeoIP, ASN, org, timezone\n",            BD, CBlue,  CR);
+    printf("  %s%ssub%s      Subdomain discovery, DNS bruteforce + IP resolve\n",   BD, CGreen, CR);
+    printf("  %s%sdir%s      Web directory discovery, status codes, depth crawl\n\n",BD, CGreen, CR);
     printf("  %s%s%s <module> -h%s  for module help\n\n", CDim, BD, P, CR);
 }
 
@@ -888,7 +890,7 @@ static void ModuleHTTP(int Argc, char **Argv) {
         long Lat=0;int Fd=TcpConnect(Host,Port,Timeout,&Lat);
         if(Fd<0){fprintf(stderr,"  %s%s[ERR]%s Cannot connect to %s:%d\n\n",BD,CRed,CR,Host,Port);return;}
 
-        char Req[1024];
+        char Req[4096];
         snprintf(Req,sizeof(Req),"%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: HTONSpider/%s\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",Method,Path,Host,VersionStr);
         SendAll(Fd,(unsigned char*)Req,(int)strlen(Req));
 
@@ -1209,6 +1211,604 @@ static void ModuleIP(int Argc, char **Argv) {
     }
 }
 
+static const char *SubWordlist[] = {
+    "www","mail","ftp","smtp","pop","imap","ns1","ns2","ns3","ns4","mx","mx1","mx2",
+    "api","dev","staging","test","demo","beta","alpha","cdn","static","assets","img",
+    "images","media","upload","download","files","docs","doc","wiki","kb","help","support",
+    "admin","panel","cp","cpanel","webmail","blog","forum","shop","store","app","apps",
+    "m","mobile","wap","portal","secure","ssl","vpn","remote","rdp","ssh","sftp","git",
+    "gitlab","github","jenkins","jira","confluence","sonar","monitor","nagios","zabbix",
+    "grafana","prometheus","kibana","elastic","solr","redis","mysql","db","database","sql",
+    "mongo","postgres","oracle","mssql","phpmyadmin","pma","adminer","backup","bak",
+    "old","new","v1","v2","v3","prod","production","uat","qa","stage","pre","preview",
+    "internal","intranet","extranet","corp","corporate","office","hr","finance","legal",
+    "marketing","sales","ops","devops","infra","cloud","aws","azure","gcp","k8s","docker",
+    "registry","repo","maven","npm","pypi","proxy","gateway","lb","loadbalancer","ha",
+    "cluster","node","worker","master","slave","primary","secondary","replica","dr",
+    "vpn2","fw","firewall","router","switch","wifi","wlan","ap","mx3","ns5","dns",
+    "dns1","dns2","autodiscover","autoconfig","_dmarc","dkim","spf","pop3","smtp2",
+    "relay","exchange","owa","outlook","calendar","video","stream","live","webrtc",
+    "turn","stun","chat","im","slack","meet","zoom","teams","crm","erp","cms","wp",
+    "wordpress","drupal","joomla","magento","woocommerce","prestashop","opencart",
+    "reporting","report","analytics","bi","dashboard","status","health","ping","uptime",
+    "log","logs","syslog","audit","scan","vuln","pentest","sec","security","cert",
+    "ca","pki","crl","ocsp","ldap","ad","sso","auth","oauth","saml","idp","sp",NULL
+};
+
+typedef struct {
+    char  Domain[256];
+    char  Sub[64];
+    char  Full[320];
+    char  IP[64];
+    int   Alive;
+} SubResult;
+
+typedef struct {
+    const char      *Domain;
+    const char      *Prefix;
+    char             DnsServer[64];
+    SubResult       *Results;
+    int              Index;
+    int              DnsTimeout2;
+    pthread_mutex_t *Lock;
+    volatile int    *Count;
+    volatile int    *Found;
+} SubWorkerArg;
+
+static int DnsResolveA(const char *Host, char *OutIP, const char *Server, int TimeoutSec) {
+    unsigned char QBuf[512], RBuf[512];
+    int QLen = DnsBuildQuery(QBuf, sizeof(QBuf), Host, 1);
+    if (QLen < 0) return -1;
+
+    int Sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (Sock < 0) return -1;
+    struct sockaddr_in SA; memset(&SA, 0, sizeof(SA));
+    SA.sin_family = AF_INET;
+    SA.sin_port   = htons(53);
+    inet_pton(AF_INET, Server, &SA.sin_addr);
+    struct timeval Tv = { TimeoutSec, 0 };
+    setsockopt(Sock, SOL_SOCKET, SO_RCVTIMEO, &Tv, sizeof(Tv));
+    setsockopt(Sock, SOL_SOCKET, SO_SNDTIMEO, &Tv, sizeof(Tv));
+    if (sendto(Sock, QBuf, QLen, 0, (struct sockaddr*)&SA, sizeof(SA)) < 0) {
+        close(Sock); return -1;
+    }
+    int RLen = (int)recv(Sock, RBuf, sizeof(RBuf), 0);
+    close(Sock);
+    if (RLen < 12) return -1;
+
+    int Rcode = RBuf[3] & 0x0F;
+    if (Rcode != 0) return -1;
+
+    int Ancount = (RBuf[6] << 8) | RBuf[7];
+    if (Ancount <= 0) return -1;
+    int Off = 12;
+    char Tmp[256];
+    int Skip = DnsExpandName(RBuf, RLen, Off, Tmp, sizeof(Tmp));
+    if (Skip < 0) return -1;
+    Off = Skip + 4;
+    for (int i = 0; i < Ancount && Off + 10 < RLen; i++) {
+        int NE = DnsExpandName(RBuf, RLen, Off, Tmp, sizeof(Tmp));
+        if (NE < 0) break;
+        Off = NE;
+        if (Off + 10 > RLen) break;
+        uint16_t RType = (RBuf[Off] << 8) | RBuf[Off+1];
+        uint16_t RDLen = (RBuf[Off+8] << 8) | RBuf[Off+9];
+        Off += 10;
+        if (Off + RDLen > RLen) break;
+        if (RType == 1 && RDLen == 4) {
+            snprintf(OutIP, 64, "%d.%d.%d.%d",
+                RBuf[Off], RBuf[Off+1], RBuf[Off+2], RBuf[Off+3]);
+            return 0;
+        }
+        Off += RDLen;
+    }
+    return -1;
+}
+
+static void *SubWorker(void *Arg) {
+    SubWorkerArg *WA = (SubWorkerArg *)Arg;
+    char Full[320];
+    snprintf(Full, sizeof(Full), "%s.%s", WA->Prefix, WA->Domain);
+    char IP[64] = {0};
+    int Ok = (DnsResolveA(Full, IP, WA->DnsServer, WA->DnsTimeout2) == 0);
+    pthread_mutex_lock(WA->Lock);
+    (*WA->Count)++;
+    if (Ok) {
+        SubResult *R = &WA->Results[*WA->Found];
+        snprintf(R->Full,   sizeof(R->Full),   "%s", Full);
+        snprintf(R->Sub,    sizeof(R->Sub),    "%s", WA->Prefix);
+        snprintf(R->Domain, sizeof(R->Domain), "%s", WA->Domain);
+        snprintf(R->IP,     sizeof(R->IP),     "%s", IP);
+        R->Alive = 1;
+        (*WA->Found)++;
+    }
+    pthread_mutex_unlock(WA->Lock);
+    free(WA);
+    return NULL;
+}
+
+static void ModuleSub(int Argc, char **Argv) {
+    char Domain[256] = {0};
+    char DnsServer[64] = "8.8.8.8";
+    char WordlistFile[512] = {0};
+    int  Threads = 100;
+    int  ShowAll = 0;
+
+    for (int i = 0; i < Argc; i++) {
+        if      (!strcmp(Argv[i],"-h")) {
+            printf("\n  %s%ssub%s  Subdomain Discovery\n\n", BD, CGreen, CR);
+            printf("  %s%s-t%s %s<domain>%s      Target domain\n",        BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-w%s %s<file>%s        Custom wordlist file\n",  BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-s%s %s<server>%s      DNS server (def: 8.8.8.8)\n", BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-T%s %s<threads>%s     Threads (def: 100)\n",   BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-a%s                Show all (incl. NX)\n\n",   BD, CWhite, CR);
+            printf("  %s%sExample:%s\n", BD, CDim, CR);
+            printf("  %shtonspider sub -t example.com%s\n",                CDim, CR);
+            printf("  %shtonspider sub -t example.com -w subs.txt -T 200%s\n\n", CDim, CR);
+            return;
+        }
+        else if (!strcmp(Argv[i],"-t") && i+1<Argc) { snprintf(Domain,     sizeof(Domain),     "%s", Argv[++i]); }
+        else if (!strcmp(Argv[i],"-s") && i+1<Argc) { snprintf(DnsServer,  sizeof(DnsServer),  "%s", Argv[++i]); }
+        else if (!strcmp(Argv[i],"-w") && i+1<Argc) { snprintf(WordlistFile,sizeof(WordlistFile),"%s",Argv[++i]); }
+        else if (!strcmp(Argv[i],"-T") && i+1<Argc) { Threads = atoi(Argv[++i]); if (Threads < 1) Threads = 1; if (Threads > 500) Threads = 500; }
+        else if (!strcmp(Argv[i],"-a"))              { ShowAll = 1; }
+        else if (Argv[i][0] != '-' && !Domain[0])   { snprintf(Domain, sizeof(Domain), "%s", Argv[i]); }
+    }
+
+    if (!Domain[0]) { fprintf(stderr, "  %s%s[ERR]%s No domain. Use -t <domain>\n\n", BD, CRed, CR); return; }
+
+    char DomainIP[64] = {0};
+    DnsResolveA(Domain, DomainIP, DnsServer, 2);
+
+    printf("\n  %s%sSUBDOMAIN DISCOVERY%s\n", BD, CGreen, CR);
+    printf("  %s%starget%s   %s%s%s%s\n",   BD, CDim, CR, BD, CWhite, Domain, CR);
+    if (DomainIP[0])
+        printf("  %s%sip%s       %s%s%s%s\n", BD, CDim, CR, BD, CBlue, DomainIP, CR);
+    printf("  %s%sdns%s      %s%s%s%s\n",   BD, CDim, CR, CDim, BD, DnsServer, CR);
+    printf("  %s%sthreads%s  %s%s%d%s\n\n", BD, CDim, CR, BD, CWhite, Threads, CR);
+
+    char **Words = NULL;
+    int    WordCount = 0;
+    int    WordMalloc = 0;
+
+    if (WordlistFile[0]) {
+        FILE *Fp = fopen(WordlistFile, "r");
+        if (!Fp) {
+            fprintf(stderr, "  %s%s[ERR]%s Cannot open wordlist: %s\n\n", BD, CRed, CR, WordlistFile);
+            return;
+        }
+        int Cap = 4096;
+        Words = (char **)malloc(sizeof(char *) * Cap);
+        char Line[256];
+        while (fgets(Line, sizeof(Line), Fp)) {
+            TrimLine(Line);
+            if (!Line[0] || Line[0] == '#') continue;
+            if (WordCount >= Cap) { Cap *= 2; Words = (char **)realloc(Words, sizeof(char *) * Cap); }
+            Words[WordCount++] = strdup(Line);
+        }
+        fclose(Fp);
+        WordMalloc = 1;
+        printf("  %s%s[+]%s Loaded %s%d%s words from %s%s%s\n\n", BD, CGreen, CR, BD, WordCount, CR, CDim, WordlistFile, CR);
+    } else {
+        while (SubWordlist[WordCount]) WordCount++;
+        Words = (char **)SubWordlist;
+        printf("  %s%s[+]%s Using built-in wordlist %s(%d words)%s\n\n", BD, CGreen, CR, CDim, WordCount, CR);
+    }
+
+    int MaxResults = WordCount + 1;
+    SubResult *Results = (SubResult *)calloc(MaxResults, sizeof(SubResult));
+    pthread_mutex_t Lock = PTHREAD_MUTEX_INITIALIZER;
+    volatile int DoneCount2 = 0, FoundCount = 0;
+
+    pthread_t *Threads2 = (pthread_t *)malloc(sizeof(pthread_t) * WordCount);
+    int Launched = 0;
+    int BatchSize = Threads;
+    int Pos = 0;
+
+    while (Pos < WordCount && Running) {
+        int End = Pos + BatchSize;
+        if (End > WordCount) End = WordCount;
+
+        for (int i = Pos; i < End; i++) {
+            SubWorkerArg *WA = (SubWorkerArg *)malloc(sizeof(SubWorkerArg));
+            WA->Domain      = Domain;
+            WA->Prefix      = Words[i];
+            WA->Results     = Results;
+            WA->Index       = i;
+            WA->Lock        = &Lock;
+            WA->Count       = &DoneCount2;
+            WA->Found       = &FoundCount;
+            WA->DnsTimeout2 = 1;
+            snprintf(WA->DnsServer, sizeof(WA->DnsServer), "%s", DnsServer);
+            pthread_create(&Threads2[Launched], NULL, SubWorker, WA);
+            Launched++;
+        }
+
+        for (int i = Pos; i < End; i++) {
+            pthread_join(Threads2[i], NULL);
+            int D = DoneCount2, F = FoundCount;
+            float Pct = (float)D * 100.0f / (float)WordCount;
+            printf("\r  %s%s[%s", BD, CDim, CR);
+            int BW = 26;
+            for (int b = 0; b < BW; b++)
+                printf(b < (int)(Pct/100.0f*BW) ? "%s%s█%s" : "%s▒%s",
+                    (b < (int)(Pct/100.0f*BW) ? BD : ""), CGreen, CR);
+            printf("%s%s]%s %s%s%5.1f%%%s  %s%s%d/%d%s  %s%sfound: %d%s",
+                BD, CDim, CR, BD, CWhite, Pct, CR,
+                CDim, BD, D, WordCount, CR,
+                BD, CGreen, F, CR);
+            fflush(stdout);
+        }
+
+        Pos = End;
+    }
+
+    free(Threads2);
+
+    printf("\r%80s\r", "");
+
+    int TotalFound = FoundCount;
+    printf("  %s%sSUBDOMAIN RESULTS%s  %s%s%s%s\n\n",
+        BD, CGreen, CR, BD, CWhite, Domain, CR);
+
+    for (int i = 0; i < TotalFound; i++) {
+        SubResult *R = &Results[i];
+        printf("  %s%s%s%s  %s%s%s%s\n",
+            BD, CGreen, R->Full, CR,
+            BD, CBlue, R->IP, CR);
+    }
+
+    if (TotalFound == 0)
+        printf("  %s%sNo subdomains found.%s\n", CDim, BD, CR);
+
+    printf("\n  %s%schecked%s %s%s%d%s  %s%sfound%s %s%s%d%s  %s%sdns%s %s%s%s%s\n\n",
+        BD, CDim, CR, BD, CWhite, WordCount, CR,
+        BD, CDim, CR, BD, CGreen, TotalFound, CR,
+        BD, CDim, CR, CDim, BD, DnsServer, CR);
+
+    (void)ShowAll;
+    free(Results);
+    pthread_mutex_destroy(&Lock);
+    if (WordMalloc) { for (int i = 0; i < WordCount; i++) free(Words[i]); free(Words); }
+}
+
+static const char *DirWordlist[] = {
+    "admin","administrator","login","logout","dashboard","panel","cp","controlpanel",
+    "api","api/v1","api/v2","api/v3","rest","graphql","swagger","docs","documentation",
+    "index","index.php","index.html","index.htm","home","main","default",
+    "upload","uploads","files","file","download","downloads","media","static","assets",
+    "images","img","css","js","fonts","icons","thumbs","thumbnails",
+    "backup","backups","bak","old","temp","tmp","cache","logs","log",
+    "config","configuration","settings","setup","install","installer",
+    "test","testing","demo","dev","development","staging","prod",
+    "include","includes","lib","libs","library","vendor","node_modules",
+    "src","source","app","application","core","system","modules","plugins",
+    "user","users","account","accounts","profile","register","signup","signin",
+    "wp-admin","wp-login.php","wp-content","wp-includes","wordpress",
+    "phpmyadmin","pma","adminer","mysql","database","db",
+    "shell","cmd","command","exec","execute","run",
+    "robots.txt","sitemap.xml","sitemap","crossdomain.xml","xmlrpc.php",
+    ".git",".gitignore",".env",".htaccess",".htpasswd","web.config",
+    "readme","readme.txt","readme.md","changelog","license","Makefile",
+    "server-status","server-info","phpinfo.php","info.php","php.ini",
+    "cgi-bin","cgi","scripts","script","bin","exe","perl",
+    "mail","webmail","smtp","email","newsletter","contact","feedback",
+    "search","query","ajax","xhr","post","get","data","json","xml",
+    "report","reports","stats","statistics","analytics","monitor","status",
+    "health","ping","check","test.php","debug","trace","error",
+    "private","secret","hidden","secure","ssl","tls","auth","oauth",
+    "portal","intranet","internal","extranet","remote","vpn",
+    "forum","board","community","support","help","faq","wiki",
+    "blog","news","article","articles","post","posts","feed","rss",
+    "shop","store","cart","checkout","order","orders","product","products",
+    "payment","pay","billing","invoice","invoices","receipt",
+    "gallery","photo","photos","video","videos","stream","live",
+    "404","403","500","error","errors","maintenance","coming-soon",NULL
+};
+
+typedef struct {
+    int    StatusCode;
+    long   Latency;
+    long   Bytes;
+    char   Path[2048];
+    char   ContentType[128];
+    char   Location[512];
+} DirResult;
+
+typedef struct {
+    char        Host[256];
+    int         Port;
+    char        Proto[8];
+    char        BasePath[512];
+    const char *Word;
+    char        DnsServer[64];
+    DirResult  *Results;
+    int         Timeout;
+    pthread_mutex_t *Lock;
+    volatile int    *DoneRef;
+    volatile int    *FoundRef;
+} DirWorkerArg;
+
+static int HttpHead(const char *Host, int Port, const char *Proto,
+                     const char *Path, int Timeout,
+                     int *OutStatus, long *OutBytes, char *OutCT, char *OutLoc) {
+    long Lat = 0;
+    int Fd = TcpConnect(Host, Port, Timeout, &Lat);
+    if (Fd < 0) return -1;
+
+    char Req[4096];
+    snprintf(Req, sizeof(Req),
+        "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: HTONSpider/%s\r\n"
+        "Accept: */*\r\nConnection: close\r\n\r\n",
+        Path, Host, VersionStr);
+    SendAll(Fd, (unsigned char *)Req, (int)strlen(Req));
+
+    char Resp[4096]; memset(Resp, 0, sizeof(Resp));
+    int Total = 0;
+    fd_set R; struct timeval Tv;
+    while (Total < (int)sizeof(Resp) - 1) {
+        FD_ZERO(&R); FD_SET(Fd, &R);
+        Tv.tv_sec = Timeout; Tv.tv_usec = 0;
+        if (select(Fd + 1, &R, NULL, NULL, &Tv) <= 0) break;
+        int N = (int)recv(Fd, Resp + Total, sizeof(Resp) - Total - 1, 0);
+        if (N <= 0) break;
+        Total += N;
+    }
+    close(Fd);
+
+    if (Total < 12) return -1;
+
+    int Status = 0;
+    sscanf(Resp, "HTTP/%*s %d", &Status);
+    if (OutStatus) *OutStatus = Status;
+    if (OutBytes)  *OutBytes  = Total;
+
+    if (OutCT) {
+        char *CT = strcasestr(Resp, "Content-Type:");
+        if (CT) {
+            CT += 13; while (*CT == ' ') CT++;
+            char *End = strchr(CT, '\r'); if (!End) End = strchr(CT, '\n');
+            int L = End ? (int)(End - CT) : 64;
+            if (L > 127) L = 127;
+            memcpy(OutCT, CT, L); OutCT[L] = '\0';
+        }
+    }
+
+    if (OutLoc && (Status == 301 || Status == 302 || Status == 303 ||
+                   Status == 307 || Status == 308)) {
+        char *Loc = strcasestr(Resp, "Location:");
+        if (Loc) {
+            Loc += 9; while (*Loc == ' ') Loc++;
+            char *End = strchr(Loc, '\r'); if (!End) End = strchr(Loc, '\n');
+            int L = End ? (int)(End - Loc) : 256;
+            if (L > 511) L = 511;
+            memcpy(OutLoc, Loc, L); OutLoc[L] = '\0';
+        }
+    }
+    (void)Proto;
+    return Status;
+}
+
+static void *DirWorker(void *Arg) {
+    DirWorkerArg *WA = (DirWorkerArg *)Arg;
+    char FullPath[2048];
+    snprintf(FullPath, sizeof(FullPath), "%.*s%.*s", 1023, WA->BasePath, 1023, WA->Word);
+
+    int Status = 0; long Bytes = 0;
+    char CT[128] = {0}, Loc[512] = {0};
+    int Ret = HttpHead(WA->Host, WA->Port, WA->Proto, FullPath,
+                       WA->Timeout, &Status, &Bytes, CT, Loc);
+
+    pthread_mutex_lock(WA->Lock);
+    (*WA->DoneRef)++;
+    if (Ret > 0 && Status != 404 && Status != 0) {
+        DirResult *R = &WA->Results[*WA->FoundRef];
+        R->StatusCode = Status;
+        R->Latency    = 0;
+        R->Bytes      = Bytes;
+        snprintf(R->Path,        sizeof(R->Path),        "%s", FullPath);
+        snprintf(R->ContentType, sizeof(R->ContentType), "%s", CT);
+        snprintf(R->Location,    sizeof(R->Location),    "%s", Loc);
+        (*WA->FoundRef)++;
+    }
+    pthread_mutex_unlock(WA->Lock);
+    free(WA);
+    return NULL;
+}
+
+static const char *StatusColor(int Code) {
+    if (Code >= 200 && Code < 300) return "\033[32m";
+    if (Code >= 300 && Code < 400) return "\033[34m";
+    if (Code >= 400 && Code < 500) return "\033[31m";
+    if (Code >= 500) return "\033[31m";
+    return "\033[2m";
+}
+
+static void ModuleDir(int Argc, char **Argv) {
+    char Url[512] = {0};
+    char WordlistFile[512] = {0};
+    int  Threads = 50;
+    int  Timeout = 5;
+    int  Depth   = 1;
+    int  ShowAll = 0;
+
+    for (int i = 0; i < Argc; i++) {
+        if      (!strcmp(Argv[i],"-h")) {
+            printf("\n  %s%sdir%s  Web Directory Discovery\n\n", BD, CGreen, CR);
+            printf("  %s%s-u%s %s<url>%s         Target URL\n",           BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-w%s %s<file>%s         Wordlist file\n",        BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-T%s %s<threads>%s      Threads (def: 50)\n",   BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-t%s %s<sec>%s          Timeout (def: 5)\n",    BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-D%s %s<depth>%s        Crawl depth (def: 1)\n",BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-a%s                 Show 4xx responses too\n",  BD, CWhite, CR);
+            printf("\n  %s%sExample:%s\n", BD, CDim, CR);
+            printf("  %shtonspider dir -u http://example.com%s\n",         CDim, CR);
+            printf("  %shtonspider dir -u http://example.com -D 2 -w list.txt%s\n\n", CDim, CR);
+            return;
+        }
+        else if (!strcmp(Argv[i],"-u") && i+1<Argc) { snprintf(Url,         sizeof(Url),         "%s", Argv[++i]); }
+        else if (!strcmp(Argv[i],"-w") && i+1<Argc) { snprintf(WordlistFile, sizeof(WordlistFile), "%s", Argv[++i]); }
+        else if (!strcmp(Argv[i],"-T") && i+1<Argc) { Threads = atoi(Argv[++i]); if (Threads < 1) Threads = 1; if (Threads > 200) Threads = 200; }
+        else if (!strcmp(Argv[i],"-t") && i+1<Argc) { Timeout = atoi(Argv[++i]); }
+        else if (!strcmp(Argv[i],"-D") && i+1<Argc) { Depth   = atoi(Argv[++i]); if (Depth < 1) Depth = 1; if (Depth > 5) Depth = 5; }
+        else if (!strcmp(Argv[i],"-a"))              { ShowAll = 1; }
+        else if (Argv[i][0] != '-' && !Url[0])      { snprintf(Url, sizeof(Url), "%s", Argv[i]); }
+    }
+
+    if (!Url[0]) { fprintf(stderr, "  %s%s[ERR]%s No URL. Use -u <url>\n\n", BD, CRed, CR); return; }
+
+    if (strncmp(Url, "http", 4) != 0) {
+        char Tmp[520]; snprintf(Tmp, sizeof(Tmp), "http://%.510s", Url);
+        snprintf(Url, sizeof(Url), "%.511s", Tmp);
+    }
+
+    char Proto[8] = "http", Host[256] = {0}, BasePath[512] = "/";
+    int  Port = 80;
+    char *Sl = strstr(Url, "://");
+    if (Sl) {
+        size_t PL = (size_t)(Sl - Url); if (PL < 8) { memcpy(Proto, Url, PL); Proto[PL] = '\0'; }
+        Sl += 3;
+    } else Sl = Url;
+    if (strcasecmp(Proto, "https") == 0) Port = 443;
+    char *PS = strchr(Sl, '/');
+    if (PS) {
+        snprintf(BasePath, sizeof(BasePath), "%s", PS);
+        size_t HL = (size_t)(PS - Sl); if (HL >= sizeof(Host)) HL = sizeof(Host) - 1;
+        memcpy(Host, Sl, HL); Host[HL] = '\0';
+    } else {
+        snprintf(Host, sizeof(Host), "%.*s", (int)(sizeof(Host) - 1), Sl);
+    }
+    char *CP = strchr(Host, ':'); if (CP) { Port = atoi(CP + 1); *CP = '\0'; }
+    if (BasePath[strlen(BasePath) - 1] != '/') strncat(BasePath, "/", sizeof(BasePath) - strlen(BasePath) - 1);
+
+    char IP[64] = {0}; ResolveStr(Host, IP, sizeof(IP));
+
+    printf("\n  %s%sDIR DISCOVERY%s\n", BD, CGreen, CR);
+    printf("  %s%starget%s   %s%s%s://%s:%d%s%s%s\n", BD, CDim, CR, BD, CWhite, Proto, Host, Port, BasePath, CR, "");
+    if (IP[0]) printf("  %s%sip%s       %s%s%s%s\n", BD, CDim, CR, BD, CBlue, IP, CR);
+    printf("  %s%sdepth%s    %s%s%d%s  %s%sthreads%s %s%s%d%s  %s%stimeout%s %s%s%ds%s\n\n",
+        BD, CDim, CR, BD, CWhite, Depth, CR,
+        BD, CDim, CR, BD, CWhite, Threads, CR,
+        BD, CDim, CR, BD, CWhite, Timeout, CR);
+
+    char **Words = NULL; int WordCount = 0; int WordMalloc = 0;
+    if (WordlistFile[0]) {
+        FILE *Fp = fopen(WordlistFile, "r");
+        if (!Fp) { fprintf(stderr, "  %s%s[ERR]%s Cannot open: %s\n\n", BD, CRed, CR, WordlistFile); return; }
+        int Cap = 4096;
+        Words = (char **)malloc(sizeof(char *) * Cap);
+        char Line[256];
+        while (fgets(Line, sizeof(Line), Fp)) {
+            TrimLine(Line); if (!Line[0] || Line[0] == '#') continue;
+            if (WordCount >= Cap) { Cap *= 2; Words = (char **)realloc(Words, sizeof(char *) * Cap); }
+            Words[WordCount++] = strdup(Line);
+        }
+        fclose(Fp); WordMalloc = 1;
+        printf("  %s%s[+]%s Loaded %s%d%s words from %s%s%s\n\n", BD, CGreen, CR, BD, WordCount, CR, CDim, WordlistFile, CR);
+    } else {
+        while (DirWordlist[WordCount]) WordCount++;
+        Words = (char **)DirWordlist;
+        printf("  %s%s[+]%s Built-in wordlist %s(%d paths)%s\n\n", BD, CGreen, CR, CDim, WordCount, CR);
+    }
+
+    int MaxRes = WordCount * Depth + 1;
+    DirResult *Results = (DirResult *)calloc(MaxRes, sizeof(DirResult));
+    pthread_mutex_t Lock = PTHREAD_MUTEX_INITIALIZER;
+    volatile int DirDone = 0, DirFound = 0;
+
+    char *CurrentPaths[8]; int PathCount = 0;
+    CurrentPaths[PathCount++] = strdup(BasePath);
+
+    for (int D = 0; D < Depth && Running; D++) {
+        if (PathCount == 0) break;
+        char *ScanPath = CurrentPaths[0];
+
+        printf("  %s%s[depth %d]%s  %s%s%s\n\n", BD, CDim, D + 1, CR, CDim, ScanPath, CR);
+        DirDone = 0;
+
+        pthread_t *Thr = (pthread_t *)malloc(sizeof(pthread_t) * WordCount);
+        int Launched = 0, Active = 0;
+
+        for (int i = 0; i < WordCount && Running; i++) {
+            while (Active >= Threads) {
+                usleep(3000);
+                pthread_mutex_lock(&Lock);
+                Active = Launched - DirDone;
+                pthread_mutex_unlock(&Lock);
+            }
+            DirWorkerArg *WA = (DirWorkerArg *)malloc(sizeof(DirWorkerArg));
+            snprintf(WA->Host,     sizeof(WA->Host),     "%s", Host);
+            snprintf(WA->Proto,    sizeof(WA->Proto),    "%s", Proto);
+            snprintf(WA->BasePath, sizeof(WA->BasePath), "%s", ScanPath);
+            WA->Port    = Port;
+            WA->Word    = Words[i];
+            WA->Timeout = Timeout;
+            WA->Results = Results;
+            WA->Lock    = &Lock;
+            WA->DoneRef = &DirDone;
+            WA->FoundRef= &DirFound;
+            pthread_create(&Thr[Launched], NULL, DirWorker, WA);
+            Launched++; Active++;
+
+            pthread_mutex_lock(&Lock);
+            int Dn = DirDone, Fn = DirFound;
+            pthread_mutex_unlock(&Lock);
+            float Pct = (float)Dn * 100.0f / (float)WordCount;
+            printf("\r  %s%s[%s", BD, CDim, CR);
+            int BW = 26;
+            for (int b = 0; b < BW; b++)
+                printf(b < (int)(Pct / 100.0f * BW) ? "%s%s█%s" : "%s▒%s",
+                    (b < (int)(Pct / 100.0f * BW) ? BD : ""), CGreen, CR);
+            printf("%s%s]%s %s%s%5.1f%%%s  %s%s%d/%d%s  %s%sfound: %d%s",
+                BD, CDim, CR, BD, CWhite, Pct, CR,
+                CDim, BD, Dn, WordCount, CR,
+                BD, CGreen, Fn, CR);
+            fflush(stdout);
+        }
+
+        for (int i = 0; i < Launched; i++) pthread_join(Thr[i], NULL);
+        free(Thr);
+        printf("\r%80s\r", "");
+        free(ScanPath);
+        PathCount = 0;
+    }
+
+    int TotalFound = DirFound;
+    printf("  %s%sDIR RESULTS%s  %s%s%s://%s:%d%s\n\n",
+        BD, CGreen, CR, BD, CWhite, Proto, Host, Port, CR);
+
+    for (int i = 0; i < TotalFound; i++) {
+        DirResult *R = &Results[i];
+        if (!ShowAll && R->StatusCode >= 400 && R->StatusCode < 500) continue;
+        const char *SC = StatusColor(R->StatusCode);
+        printf("  %s%s[%d]%s  %s%s%s%s",
+            BD, SC, R->StatusCode, CR,
+            BD, CGreen, R->Path, CR);
+        if (R->Location[0])
+            printf("  %s%s→ %s%s", CDim, BD, R->Location, CR);
+        printf("\n");
+    }
+
+    if (TotalFound == 0 || (!ShowAll && TotalFound > 0)) {
+        int Shown = 0;
+        for (int i = 0; i < TotalFound; i++) {
+            DirResult *R = &Results[i];
+            if (R->StatusCode >= 200 && R->StatusCode < 400) Shown++;
+        }
+        if (Shown == 0 && !ShowAll)
+            printf("  %s%sNo accessible paths found. Try -a to show 4xx.%s\n", CDim, BD, CR);
+    }
+
+    printf("\n  %s%schecked%s %s%s%d%s  %s%sfound%s %s%s%d%s  %s%sdepth%s %s%s%d%s\n\n",
+        BD, CDim, CR, BD, CWhite, WordCount * Depth, CR,
+        BD, CDim, CR, BD, CGreen, TotalFound, CR,
+        BD, CDim, CR, BD, CWhite, Depth, CR);
+
+    free(Results);
+    pthread_mutex_destroy(&Lock);
+    if (WordMalloc) { for (int i = 0; i < WordCount; i++) free(Words[i]); free(Words); }
+}
+
 int main(int Argc, char **Argv) {
     signal(SIGINT,SigHandler);signal(SIGTERM,SigHandler);
     if(Argc<2||!strcmp(Argv[1],"-h")||!strcmp(Argv[1],"help")||!strcmp(Argv[1],"--help")){PrintMainHelp(Argv[0]);return 0;}
@@ -1224,6 +1824,8 @@ int main(int Argc, char **Argv) {
     else if(!strcmp(Mod,"banner"))ModuleBanner(MAc,MAv);
     else if(!strcmp(Mod,"subnet"))ModuleSubnet(MAc,MAv);
     else if(!strcmp(Mod,"ip"))    ModuleIP(MAc,MAv);
+    else if(!strcmp(Mod,"sub"))   ModuleSub(MAc,MAv);
+    else if(!strcmp(Mod,"dir"))   ModuleDir(MAc,MAv);
     else{fprintf(stderr,"  %s%s[ERR]%s Unknown module: %s\n\n",BD,CRed,CR,Mod);return 1;}
     return 0;
 }
