@@ -64,13 +64,6 @@ static const char *CDim   = "\033[2m";
 
 
 
-
-
-
-
-
-
-
 static const char *BD   = "\033[1m";
 
 

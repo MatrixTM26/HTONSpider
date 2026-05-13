@@ -17,7 +17,7 @@ gcc -O2 -Wall -o htonspider htonspider.c -lpthread -lm
 
 ### Usage Example
 
-**TOOLS HELP**
+**Tool Help**
 
 ```bash
 ./htonspider -h
