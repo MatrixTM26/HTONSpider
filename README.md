@@ -17,6 +17,20 @@ gcc -O2 -Wall -o htonspider htonspider.c -lpthread -lm
 
 ### Usage Example
 
+**TOOLS HELP**
+
+```bash
+./htonspider -h
+```
+
+```bash
+./htonspider <module> [option]
+```
+
+```bash
+./htonspider sub -h
+```
+
 **Proxy Check**
 
 ```bash
@@ -57,3 +71,30 @@ gcc -O2 -Wall -o htonspider htonspider.c -lpthread -lm
 ./htonspider subnet 172.0.0.0/24
 ```
 
+**Subdomain Finder**
+
+```bash
+./htonspider sub -t example.com
+```
+
+```bash
+./htonspider sub -t example.com -H -p 443 -F alive -T 1000
+```
+
+```bash
+./htonspider sub -t example.com -H -p 443 -F alive -w wordlist/subdomain/default.txt -T 1000
+```
+
+**Directory Brute Forcing**
+
+```bash
+./htonspider dir -u example.com
+```
+
+```bash
+./htonspider dir -u example.com -D 3 -T 1000 -t 5
+```
+
+```bash
+./htonspider dir -u example.com -D 3 -T 1000 -t 5 -w wordlist/directories/default.txt
+```

@@ -1241,6 +1241,14 @@ typedef struct {
     char  Full[320];
     char  IP[64];
     int   Alive;
+    int   HttpStatus;
+    int   HttpsStatus;
+    long  HttpLatency;
+    char  Title[128];
+    char  Redirect[256];
+    int   PortOpen[8];
+    int   PortList[8];
+    int   PortCount;
 } SubResult;
 
 typedef struct {
@@ -1250,6 +1258,9 @@ typedef struct {
     SubResult       *Results;
     int              Index;
     int              DnsTimeout2;
+    int              HttpProbe;
+    int              CheckPorts[8];
+    int              CheckPortCount;
     pthread_mutex_t *Lock;
     volatile int    *Count;
     volatile int    *Found;
@@ -1305,54 +1316,170 @@ static int DnsResolveA(const char *Host, char *OutIP, const char *Server, int Ti
     return -1;
 }
 
+static const char *StatusColor(int Code) {
+    if (Code >= 200 && Code < 300) return "\033[32m";
+    if (Code >= 300 && Code < 400) return "\033[34m";
+    if (Code >= 400 && Code < 500) return "\033[31m";
+    if (Code >= 500)               return "\033[31m";
+    return "\033[2m";
+}
+
+static int SubHttpProbe(const char *Host, int Port, int UseHttps,
+                         int *OutStatus, char *OutTitle, char *OutRedir, long *OutLat) {
+    long Lat = 0;
+    int Fd = TcpConnect(Host, Port, 3, &Lat);
+    if (Fd < 0) return 0;
+
+    char Req[512];
+    snprintf(Req, sizeof(Req),
+        "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: HTONSpider/%s\r\n"
+        "Accept: */*\r\nConnection: close\r\n\r\n", Host, VersionStr);
+    SendAll(Fd, (unsigned char *)Req, (int)strlen(Req));
+
+    char Resp[4096]; memset(Resp, 0, sizeof(Resp)); int Total = 0;
+    fd_set R; struct timeval Tv;
+    while (Total < (int)sizeof(Resp) - 1) {
+        FD_ZERO(&R); FD_SET(Fd, &R);
+        Tv.tv_sec = 3; Tv.tv_usec = 0;
+        if (select(Fd + 1, &R, NULL, NULL, &Tv) <= 0) break;
+        int N = (int)recv(Fd, Resp + Total, sizeof(Resp) - Total - 1, 0);
+        if (N <= 0) break;
+        Total += N;
+    }
+    close(Fd);
+    if (Total < 10) return 0;
+
+    int Status = 0;
+    sscanf(Resp, "HTTP/%*s %d", &Status);
+    if (OutStatus) *OutStatus = Status;
+    if (OutLat)    *OutLat    = Lat;
+
+    if (OutRedir) {
+        char *Loc = strcasestr(Resp, "Location:");
+        if (Loc) {
+            Loc += 9; while (*Loc == ' ') Loc++;
+            char *End = strchr(Loc, '\r'); if (!End) End = strchr(Loc, '\n');
+            int L = End ? (int)(End - Loc) : 64;
+            if (L > 255) L = 255;
+            memcpy(OutRedir, Loc, L); OutRedir[L] = '\0';
+        }
+    }
+
+    if (OutTitle) {
+        char *TitleTag = strcasestr(Resp, "<title");
+        if (TitleTag) {
+            char *TStart = strchr(TitleTag, '>');
+            if (TStart) {
+                TStart++;
+                char *TEnd = strcasestr(TStart, "</title>");
+                if (TEnd) {
+                    int L = (int)(TEnd - TStart);
+                    if (L > 127) L = 127;
+                    memcpy(OutTitle, TStart, L); OutTitle[L] = '\0';
+                    TrimLine(OutTitle);
+                }
+            }
+        }
+    }
+    (void)UseHttps;
+    return Status > 0 ? 1 : 0;
+}
+
 static void *SubWorker(void *Arg) {
     SubWorkerArg *WA = (SubWorkerArg *)Arg;
     char Full[320];
     snprintf(Full, sizeof(Full), "%s.%s", WA->Prefix, WA->Domain);
     char IP[64] = {0};
     int Ok = (DnsResolveA(Full, IP, WA->DnsServer, WA->DnsTimeout2) == 0);
-    pthread_mutex_lock(WA->Lock);
-    (*WA->Count)++;
+
     if (Ok) {
+        pthread_mutex_lock(WA->Lock);
         SubResult *R = &WA->Results[*WA->Found];
         snprintf(R->Full,   sizeof(R->Full),   "%s", Full);
         snprintf(R->Sub,    sizeof(R->Sub),    "%s", WA->Prefix);
         snprintf(R->Domain, sizeof(R->Domain), "%s", WA->Domain);
         snprintf(R->IP,     sizeof(R->IP),     "%s", IP);
-        R->Alive = 1;
+        R->Alive    = 1;
+        R->PortCount = 0;
         (*WA->Found)++;
+        pthread_mutex_unlock(WA->Lock);
+
+        if (WA->HttpProbe) {
+            SubHttpProbe(Full, 80, 0,
+                &R->HttpStatus, R->Title, R->Redirect, &R->HttpLatency);
+            SubHttpProbe(Full, 443, 1,
+                &R->HttpsStatus, NULL, NULL, NULL);
+        }
+
+        if (WA->CheckPortCount > 0) {
+            for (int p = 0; p < WA->CheckPortCount && p < 8; p++) {
+                long Lat = 0;
+                int Fd = TcpConnect(IP, WA->CheckPorts[p], 2, &Lat);
+                if (Fd >= 0) {
+                    close(Fd);
+                    R->PortList[R->PortCount] = WA->CheckPorts[p];
+                    R->PortOpen[R->PortCount] = 1;
+                    R->PortCount++;
+                }
+            }
+        }
     }
+
+    pthread_mutex_lock(WA->Lock);
+    (*WA->Count)++;
     pthread_mutex_unlock(WA->Lock);
     free(WA);
     return NULL;
 }
 
 static void ModuleSub(int Argc, char **Argv) {
-    char Domain[256] = {0};
-    char DnsServer[64] = "8.8.8.8";
+    char Domain[256]       = {0};
+    char DnsServer[64]     = "8.8.8.8";
     char WordlistFile[512] = {0};
-    int  Threads = 100;
-    int  ShowAll = 0;
+    char ExportFile[512]   = {0};
+    int  Threads           = 100;
+    int  HttpProbe         = 0;
+    int  FilterAliveOnly   = 0;
+    int  FilterDeadOnly    = 0;
+    int  CheckPorts[8]     = {0};
+    int  CheckPortCount    = 0;
 
     for (int i = 0; i < Argc; i++) {
         if      (!strcmp(Argv[i],"-h")) {
             printf("\n  %s%ssub%s  Subdomain Discovery\n\n", BD, CGreen, CR);
-            printf("  %s%s-t%s %s<domain>%s      Target domain\n",        BD, CWhite, CR, CDim, CR);
-            printf("  %s%s-w%s %s<file>%s        Custom wordlist file\n",  BD, CWhite, CR, CDim, CR);
-            printf("  %s%s-s%s %s<server>%s      DNS server (def: 8.8.8.8)\n", BD, CWhite, CR, CDim, CR);
-            printf("  %s%s-T%s %s<threads>%s     Threads (def: 100)\n",   BD, CWhite, CR, CDim, CR);
-            printf("  %s%s-a%s                Show all (incl. NX)\n\n",   BD, CWhite, CR);
-            printf("  %s%sExample:%s\n", BD, CDim, CR);
-            printf("  %shtonspider sub -t example.com%s\n",                CDim, CR);
-            printf("  %shtonspider sub -t example.com -w subs.txt -T 200%s\n\n", CDim, CR);
+            printf("  %s%s-t%s %s<domain>%s      Target domain\n",             BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-w%s %s<file>%s         Custom wordlist file\n",     BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-s%s %s<server>%s       DNS server (def: 8.8.8.8)\n",BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-T%s %s<threads>%s      Threads (def: 100)\n",       BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-p%s %s<ports>%s        Port check e.g. 80,443,8080\n",BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-H%s                 HTTP probe (status, title)\n",  BD, CWhite, CR);
+            printf("  %s%s-F%s %s<alive|dead>%s   Filter output\n",            BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-e%s %s<file>%s         Export results to file\n\n", BD, CWhite, CR, CDim, CR);
+            printf("  %s%sExamples:%s\n", BD, CDim, CR);
+            printf("  %shtonspider sub -t example.com -H -p 80,443 -F alive%s\n",     CDim, CR);
+            printf("  %shtonspider sub -t example.com -e out.txt -w subs.txt%s\n\n",  CDim, CR);
             return;
         }
-        else if (!strcmp(Argv[i],"-t") && i+1<Argc) { snprintf(Domain,     sizeof(Domain),     "%s", Argv[++i]); }
-        else if (!strcmp(Argv[i],"-s") && i+1<Argc) { snprintf(DnsServer,  sizeof(DnsServer),  "%s", Argv[++i]); }
-        else if (!strcmp(Argv[i],"-w") && i+1<Argc) { snprintf(WordlistFile,sizeof(WordlistFile),"%s",Argv[++i]); }
-        else if (!strcmp(Argv[i],"-T") && i+1<Argc) { Threads = atoi(Argv[++i]); if (Threads < 1) Threads = 1; if (Threads > 500) Threads = 500; }
-        else if (!strcmp(Argv[i],"-a"))              { ShowAll = 1; }
-        else if (Argv[i][0] != '-' && !Domain[0])   { snprintf(Domain, sizeof(Domain), "%s", Argv[i]); }
+        else if (!strcmp(Argv[i],"-t") && i+1<Argc) { snprintf(Domain,       sizeof(Domain),       "%s", Argv[++i]); }
+        else if (!strcmp(Argv[i],"-s") && i+1<Argc) { snprintf(DnsServer,    sizeof(DnsServer),    "%s", Argv[++i]); }
+        else if (!strcmp(Argv[i],"-w") && i+1<Argc) { snprintf(WordlistFile,  sizeof(WordlistFile), "%s", Argv[++i]); }
+        else if (!strcmp(Argv[i],"-e") && i+1<Argc) { snprintf(ExportFile,    sizeof(ExportFile),   "%s", Argv[++i]); }
+        else if (!strcmp(Argv[i],"-T") && i+1<Argc) { Threads = atoi(Argv[++i]); if (Threads<1) Threads=1; if (Threads>500) Threads=500; }
+        else if (!strcmp(Argv[i],"-H"))              { HttpProbe = 1; }
+        else if (!strcmp(Argv[i],"-F") && i+1<Argc) {
+            i++;
+            if      (!strcmp(Argv[i],"alive")) FilterAliveOnly = 1;
+            else if (!strcmp(Argv[i],"dead"))  FilterDeadOnly  = 1;
+        }
+        else if (!strcmp(Argv[i],"-p") && i+1<Argc) {
+            char PortBuf[64]; snprintf(PortBuf, sizeof(PortBuf), "%s", Argv[++i]);
+            char *Tok = strtok(PortBuf, ",");
+            while (Tok && CheckPortCount < 8) {
+                CheckPorts[CheckPortCount++] = atoi(Tok);
+                Tok = strtok(NULL, ",");
+            }
+        }
+        else if (Argv[i][0] != '-' && !Domain[0]) { snprintf(Domain, sizeof(Domain), "%s", Argv[i]); }
     }
 
     if (!Domain[0]) { fprintf(stderr, "  %s%s[ERR]%s No domain. Use -t <domain>\n\n", BD, CRed, CR); return; }
@@ -1361,38 +1488,40 @@ static void ModuleSub(int Argc, char **Argv) {
     DnsResolveA(Domain, DomainIP, DnsServer, 2);
 
     printf("\n  %s%sSUBDOMAIN DISCOVERY%s\n", BD, CGreen, CR);
-    printf("  %s%starget%s   %s%s%s%s\n",   BD, CDim, CR, BD, CWhite, Domain, CR);
+    printf("  %s%starget%s  %s%s%s%s\n",    BD, CDim, CR, BD, CWhite, Domain, CR);
     if (DomainIP[0])
-        printf("  %s%sip%s       %s%s%s%s\n", BD, CDim, CR, BD, CBlue, DomainIP, CR);
-    printf("  %s%sdns%s      %s%s%s%s\n",   BD, CDim, CR, CDim, BD, DnsServer, CR);
-    printf("  %s%sthreads%s  %s%s%d%s\n\n", BD, CDim, CR, BD, CWhite, Threads, CR);
+        printf("  %s%sip%s      %s%s%s%s\n", BD, CDim, CR, BD, CBlue, DomainIP, CR);
+    printf("  %s%sdns%s     %s%s%s%s\n",    BD, CDim, CR, CDim, BD, DnsServer, CR);
+    printf("  %s%sopts%s    threads=%s%s%d%s", BD, CDim, CR, BD, CWhite, Threads, CR);
+    if (HttpProbe) printf("  %s%sHTTP-probe%s", BD, CGreen, CR);
+    if (CheckPortCount > 0) {
+        printf("  %s%sports=%s", BD, CDim, CR);
+        for (int p = 0; p < CheckPortCount; p++)
+            printf("%s%s%d%s%s", BD, CWhite, CheckPorts[p], CR, p<CheckPortCount-1?",":"");
+    }
+    if (FilterAliveOnly) printf("  %s%sfilter=alive%s", BD, CGreen, CR);
+    if (FilterDeadOnly)  printf("  %s%sfilter=dead%s",  BD, CRed,   CR);
+    if (ExportFile[0])   printf("  %s%sexport=%s%s%s",  BD, CDim, CR, CDim, ExportFile);
+    printf("%s\n\n", CR);
 
-    char **Words = NULL;
-    int    WordCount = 0;
-    int    WordMalloc = 0;
-
+    char **Words = NULL; int WordCount = 0; int WordMalloc = 0;
     if (WordlistFile[0]) {
         FILE *Fp = fopen(WordlistFile, "r");
-        if (!Fp) {
-            fprintf(stderr, "  %s%s[ERR]%s Cannot open wordlist: %s\n\n", BD, CRed, CR, WordlistFile);
-            return;
-        }
+        if (!Fp) { fprintf(stderr, "  %s%s[ERR]%s Cannot open: %s\n\n", BD, CRed, CR, WordlistFile); return; }
         int Cap = 4096;
         Words = (char **)malloc(sizeof(char *) * Cap);
         char Line[256];
         while (fgets(Line, sizeof(Line), Fp)) {
-            TrimLine(Line);
-            if (!Line[0] || Line[0] == '#') continue;
-            if (WordCount >= Cap) { Cap *= 2; Words = (char **)realloc(Words, sizeof(char *) * Cap); }
+            TrimLine(Line); if (!Line[0] || Line[0]=='#') continue;
+            if (WordCount >= Cap) { Cap *= 2; Words = (char **)realloc(Words, sizeof(char *)*Cap); }
             Words[WordCount++] = strdup(Line);
         }
-        fclose(Fp);
-        WordMalloc = 1;
+        fclose(Fp); WordMalloc = 1;
         printf("  %s%s[+]%s Loaded %s%d%s words from %s%s%s\n\n", BD, CGreen, CR, BD, WordCount, CR, CDim, WordlistFile, CR);
     } else {
         while (SubWordlist[WordCount]) WordCount++;
         Words = (char **)SubWordlist;
-        printf("  %s%s[+]%s Using built-in wordlist %s(%d words)%s\n\n", BD, CGreen, CR, CDim, WordCount, CR);
+        printf("  %s%s[+]%s Built-in wordlist %s(%d words)%s\n\n", BD, CGreen, CR, CDim, WordCount, CR);
     }
 
     int MaxResults = WordCount + 1;
@@ -1401,24 +1530,25 @@ static void ModuleSub(int Argc, char **Argv) {
     volatile int DoneCount2 = 0, FoundCount = 0;
 
     pthread_t *Threads2 = (pthread_t *)malloc(sizeof(pthread_t) * WordCount);
-    int Launched = 0;
-    int BatchSize = Threads;
-    int Pos = 0;
+    int Launched = 0, Pos = 0;
 
     while (Pos < WordCount && Running) {
-        int End = Pos + BatchSize;
+        int End = Pos + Threads;
         if (End > WordCount) End = WordCount;
 
         for (int i = Pos; i < End; i++) {
             SubWorkerArg *WA = (SubWorkerArg *)malloc(sizeof(SubWorkerArg));
-            WA->Domain      = Domain;
-            WA->Prefix      = Words[i];
-            WA->Results     = Results;
-            WA->Index       = i;
-            WA->Lock        = &Lock;
-            WA->Count       = &DoneCount2;
-            WA->Found       = &FoundCount;
-            WA->DnsTimeout2 = 1;
+            WA->Domain         = Domain;
+            WA->Prefix         = Words[i];
+            WA->Results        = Results;
+            WA->Index          = i;
+            WA->Lock           = &Lock;
+            WA->Count          = &DoneCount2;
+            WA->Found          = &FoundCount;
+            WA->DnsTimeout2    = 1;
+            WA->HttpProbe      = HttpProbe;
+            WA->CheckPortCount = CheckPortCount;
+            for (int p = 0; p < CheckPortCount; p++) WA->CheckPorts[p] = CheckPorts[p];
             snprintf(WA->DnsServer, sizeof(WA->DnsServer), "%s", DnsServer);
             pthread_create(&Threads2[Launched], NULL, SubWorker, WA);
             Launched++;
@@ -1429,44 +1559,109 @@ static void ModuleSub(int Argc, char **Argv) {
             int D = DoneCount2, F = FoundCount;
             float Pct = (float)D * 100.0f / (float)WordCount;
             printf("\r  %s%s[%s", BD, CDim, CR);
-            int BW = 26;
+            int BW = 24;
             for (int b = 0; b < BW; b++)
                 printf(b < (int)(Pct/100.0f*BW) ? "%s%s█%s" : "%s▒%s",
                     (b < (int)(Pct/100.0f*BW) ? BD : ""), CGreen, CR);
-            printf("%s%s]%s %s%s%5.1f%%%s  %s%s%d/%d%s  %s%sfound: %d%s",
+            printf("%s%s]%s %s%s%5.1f%%%s  %s%s%d/%d%s  %s%s+%d%s",
                 BD, CDim, CR, BD, CWhite, Pct, CR,
                 CDim, BD, D, WordCount, CR,
                 BD, CGreen, F, CR);
             fflush(stdout);
         }
-
         Pos = End;
     }
 
     free(Threads2);
-
     printf("\r%80s\r", "");
 
     int TotalFound = FoundCount;
+    int AliveCount2 = 0, DeadCount2 = 0;
+    for (int i = 0; i < TotalFound; i++) {
+        if (Results[i].Alive) AliveCount2++; else DeadCount2++;
+    }
+
     printf("  %s%sSUBDOMAIN RESULTS%s  %s%s%s%s\n\n",
         BD, CGreen, CR, BD, CWhite, Domain, CR);
 
     for (int i = 0; i < TotalFound; i++) {
         SubResult *R = &Results[i];
-        printf("  %s%s%s%s  %s%s%s%s\n",
-            BD, CGreen, R->Full, CR,
-            BD, CBlue, R->IP, CR);
+        if (FilterAliveOnly && !R->Alive) continue;
+        if (FilterDeadOnly  &&  R->Alive) continue;
+
+        if (R->Alive) {
+            printf("  %s%s%s%s  %s%s%s%s",
+                BD, CGreen, R->Full, CR,
+                BD, CBlue, R->IP, CR);
+
+            if (HttpProbe) {
+                if (R->HttpStatus > 0) {
+                    const char *SC = StatusColor(R->HttpStatus);
+                    printf("  %s%s[http:%d]%s", BD, SC, R->HttpStatus, CR);
+                }
+                if (R->HttpsStatus > 0) {
+                    const char *SC = StatusColor(R->HttpsStatus);
+                    printf("  %s%s[https:%d]%s", BD, SC, R->HttpsStatus, CR);
+                }
+                if (R->Title[0])
+                    printf("  %s%s\"%s\"%s", CDim, BD, R->Title, CR);
+                if (R->Redirect[0])
+                    printf("  %s%s→%s%s", CDim, BD, R->Redirect, CR);
+            }
+
+            if (R->PortCount > 0) {
+                printf("  %s%sports:%s", BD, CDim, CR);
+                for (int p = 0; p < R->PortCount; p++)
+                    printf("%s%s%d%s%s", BD, CGreen, R->PortList[p], CR, p<R->PortCount-1?",":"");
+            }
+        } else {
+            printf("  %s%s%s%s  %s%sDEAD%s",
+                CDim, BD, R->Full, CR, BD, CRed, CR);
+        }
+        printf("\n");
     }
 
     if (TotalFound == 0)
         printf("  %s%sNo subdomains found.%s\n", CDim, BD, CR);
 
-    printf("\n  %s%schecked%s %s%s%d%s  %s%sfound%s %s%s%d%s  %s%sdns%s %s%s%s%s\n\n",
+    printf("\n  %s%schecked%s %s%s%d%s  %s%salive%s %s%s%d%s  %s%sdead%s %s%s%d%s\n\n",
         BD, CDim, CR, BD, CWhite, WordCount, CR,
-        BD, CDim, CR, BD, CGreen, TotalFound, CR,
-        BD, CDim, CR, CDim, BD, DnsServer, CR);
+        BD, CDim, CR, BD, CGreen, AliveCount2, CR,
+        BD, CDim, CR, BD, CRed, DeadCount2, CR);
 
-    (void)ShowAll;
+    if (ExportFile[0]) {
+        FILE *Fp = fopen(ExportFile, "w");
+        if (Fp) {
+            time_t Now = time(NULL); struct tm *Tm = localtime(&Now); char TB[64];
+            strftime(TB, sizeof(TB), "%Y-%m-%d %H:%M:%S", Tm);
+            fprintf(Fp, "# HTONSpider sub  |  %s  |  %s\n", Domain, TB);
+            fprintf(Fp, "# checked: %d  alive: %d  dead: %d\n#\n", WordCount, AliveCount2, DeadCount2);
+            for (int i = 0; i < TotalFound; i++) {
+                SubResult *R = &Results[i];
+                if (FilterAliveOnly && !R->Alive) continue;
+                if (FilterDeadOnly  &&  R->Alive) continue;
+                if (R->Alive) {
+                    fprintf(Fp, "%s  %s", R->Full, R->IP);
+                    if (HttpProbe && R->HttpStatus  > 0) fprintf(Fp, "  http:%d",  R->HttpStatus);
+                    if (HttpProbe && R->HttpsStatus > 0) fprintf(Fp, "  https:%d", R->HttpsStatus);
+                    if (HttpProbe && R->Title[0])         fprintf(Fp, "  \"%s\"",   R->Title);
+                    if (R->PortCount > 0) {
+                        fprintf(Fp, "  ports:");
+                        for (int p = 0; p < R->PortCount; p++)
+                            fprintf(Fp, "%d%s", R->PortList[p], p<R->PortCount-1?",":"");
+                    }
+                    fprintf(Fp, "\n");
+                } else {
+                    fprintf(Fp, "# DEAD  %s\n", R->Full);
+                }
+            }
+            fclose(Fp);
+            printf("  %s%s[✓]%s Saved to %s%s%s%s\n\n", BD, CGreen, CR, BD, CDim, ExportFile, CR);
+        } else {
+            fprintf(stderr, "  %s%s[ERR]%s Cannot write: %s\n\n", BD, CRed, CR, ExportFile);
+        }
+    }
+
     free(Results);
     pthread_mutex_destroy(&Lock);
     if (WordMalloc) { for (int i = 0; i < WordCount; i++) free(Words[i]); free(Words); }
@@ -1614,14 +1809,6 @@ static void *DirWorker(void *Arg) {
     pthread_mutex_unlock(WA->Lock);
     free(WA);
     return NULL;
-}
-
-static const char *StatusColor(int Code) {
-    if (Code >= 200 && Code < 300) return "\033[32m";
-    if (Code >= 300 && Code < 400) return "\033[34m";
-    if (Code >= 400 && Code < 500) return "\033[31m";
-    if (Code >= 500) return "\033[31m";
-    return "\033[2m";
 }
 
 static void ModuleDir(int Argc, char **Argv) {
