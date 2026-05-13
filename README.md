@@ -12,7 +12,7 @@ cd HTONSpider
 ### Compile
 
 ```bash
-gcc -O2 -Wall -o htonspider htonspider.c -lpthread
+gcc -O2 -Wall -o htonspider htonspider.c -lpthread -lm
 ```
 
 ### Usage Example
