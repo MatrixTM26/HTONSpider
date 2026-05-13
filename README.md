@@ -1,4 +1,6 @@
-# HTONSpider
+<div align="center">
+    <img src="images/logo.png" width="300px" height="auto" alt="TOMCAT-C2 Logo" >
+</div>
 
 A networking toolkit for analize, trace, and filter active proxies
 
