@@ -123,4 +123,4 @@ gcc -O2 -Wall -o htonspider htonspider.c -lpthread -lm
 
 ---
 
-<p align="center">&copy; 2026 MatrixTM26</p>
+<p align="center">&copy; 2023-2026 MatrixTM26</p>
