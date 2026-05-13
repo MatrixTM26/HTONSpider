@@ -2,6 +2,8 @@
 
 A networking toolkit for analize, trace, and filter active proxies
 
+---
+
 ### Installation and Usage
 
 ```bash
@@ -98,3 +100,27 @@ gcc -O2 -Wall -o htonspider htonspider.c -lpthread -lm
 ```bash
 ./htonspider dir -u example.com -D 3 -T 1000 -t 5 -w wordlist/directories/default.txt
 ```
+
+---
+
+<div align="left">
+
+## Support Me
+
+<p align="left">
+    If this project helps, you can support me here:
+</p>
+
+<a href="https://ko-fi.com/matriMatrixTM26" target="_blank">
+  <img src="https://ko-fi.com/img/githubbutton_sm.svg" height="20" alt="Support me on Ko-fi" />
+</a>
+
+<a href="https://trakteer.id/matriMatrixTM26">
+  <img src="https://img.shields.io/badge/Support-Trakteer-orange" height="20" alt="Support me on Trakteer"/>
+</a>
+
+</div>
+
+---
+
+<p align="center">&copy; 2026 MatrixTM26</p>
