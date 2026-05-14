@@ -64,6 +64,13 @@ static const char *CDim   = "\033[2m";
 
 
 
+
+
+
+
+
+
+
 static const char *BD   = "\033[1m";
 
 
@@ -1805,189 +1812,196 @@ static void *DirWorker(void *Arg) {
 }
 
 static void ModuleDir(int Argc, char **Argv) {
-    char Url[512] = {0};
+    char Url[512]          = {0};
     char WordlistFile[512] = {0};
-    int  Threads = 50;
-    int  Timeout = 5;
-    int  Depth   = 1;
-    int  ShowAll = 0;
+    int  Threads           = 50;
+    int  Timeout           = 5;
+    int  Depth             = 1;
+    int  ShowAll           = 0;
+    int  ForcePort         = 0;
 
     for (int i = 0; i < Argc; i++) {
         if      (!strcmp(Argv[i],"-h")) {
             printf("\n  %s%sdir%s  Web Directory Discovery\n\n", BD, CGreen, CR);
-            printf("  %s%s-u%s %s<url>%s         Target URL\n",           BD, CWhite, CR, CDim, CR);
-            printf("  %s%s-w%s %s<file>%s         Wordlist file\n",        BD, CWhite, CR, CDim, CR);
-            printf("  %s%s-T%s %s<threads>%s      Threads (def: 50)\n",   BD, CWhite, CR, CDim, CR);
-            printf("  %s%s-t%s %s<sec>%s          Timeout (def: 5)\n",    BD, CWhite, CR, CDim, CR);
-            printf("  %s%s-D%s %s<depth>%s        Crawl depth (def: 1)\n",BD, CWhite, CR, CDim, CR);
-            printf("  %s%s-a%s                 Show 4xx responses too\n",  BD, CWhite, CR);
-            printf("\n  %s%sExample:%s\n", BD, CDim, CR);
-            printf("  %shtonspider dir -u http://example.com%s\n",         CDim, CR);
-            printf("  %shtonspider dir -u http://example.com -D 2 -w list.txt%s\n\n", CDim, CR);
+            printf("  %s%s-u%s %s<url>%s         Target URL or host\n",       BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-w%s %s<file>%s         Wordlist file\n",            BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-p%s %s<port>%s         Force port (443 = https)\n", BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-T%s %s<threads>%s      Threads (def: 50)\n",        BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-t%s %s<sec>%s          Timeout (def: 5)\n",         BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-D%s %s<depth>%s        Crawl depth (def: 1)\n",     BD, CWhite, CR, CDim, CR);
+            printf("  %s%s-a%s                Show 4xx too\n",                 BD, CWhite, CR);
+            printf("\n  %s%sExamples:%s\n", BD, CDim, CR);
+            printf("  %shtonspider dir -u https://example.com -D 2%s\n",       CDim, CR);
+            printf("  %shtonspider dir -u example.com -p 443 -D 3 -a%s\n\n",  CDim, CR);
             return;
         }
-        else if (!strcmp(Argv[i],"-u") && i+1<Argc) { snprintf(Url,         sizeof(Url),         "%s", Argv[++i]); }
-        else if (!strcmp(Argv[i],"-w") && i+1<Argc) { snprintf(WordlistFile, sizeof(WordlistFile), "%s", Argv[++i]); }
-        else if (!strcmp(Argv[i],"-T") && i+1<Argc) { Threads = atoi(Argv[++i]); if (Threads < 1) Threads = 1; if (Threads > 200) Threads = 200; }
+        else if ((!strcmp(Argv[i],"-p")||!strcmp(Argv[i],"-P")) && i+1<Argc) { ForcePort = atoi(Argv[++i]); }
+        else if (!strcmp(Argv[i],"-u") && i+1<Argc) { snprintf(Url,          sizeof(Url),          "%s", Argv[++i]); }
+        else if (!strcmp(Argv[i],"-w") && i+1<Argc) { snprintf(WordlistFile,  sizeof(WordlistFile), "%s", Argv[++i]); }
+        else if (!strcmp(Argv[i],"-T") && i+1<Argc) { Threads = atoi(Argv[++i]); if (Threads<1) Threads=1; if (Threads>500) Threads=500; }
         else if (!strcmp(Argv[i],"-t") && i+1<Argc) { Timeout = atoi(Argv[++i]); }
-        else if (!strcmp(Argv[i],"-D") && i+1<Argc) { Depth   = atoi(Argv[++i]); if (Depth < 1) Depth = 1; if (Depth > 5) Depth = 5; }
+        else if (!strcmp(Argv[i],"-D") && i+1<Argc) { Depth = atoi(Argv[++i]); if (Depth<1) Depth=1; if (Depth>5) Depth=5; }
         else if (!strcmp(Argv[i],"-a"))              { ShowAll = 1; }
         else if (Argv[i][0] != '-' && !Url[0])      { snprintf(Url, sizeof(Url), "%s", Argv[i]); }
     }
 
-    if (!Url[0]) { fprintf(stderr, "  %s%s[ERR]%s No URL. Use -u <url>\n\n", BD, CRed, CR); return; }
+    if (!Url[0]) { fprintf(stderr, "  %s%s[ERR]%s No URL.\n\n", BD, CRed, CR); return; }
 
-    if (strncmp(Url, "http", 4) != 0) {
-        char Tmp[520]; snprintf(Tmp, sizeof(Tmp), "http://%.510s", Url);
+    if (strncmp(Url, "http://", 7) != 0 && strncmp(Url, "https://", 8) != 0) {
+        char Tmp[520];
+        snprintf(Tmp, sizeof(Tmp), "%s://%.504s", (ForcePort==443)?"https":"http", Url);
         snprintf(Url, sizeof(Url), "%.511s", Tmp);
     }
 
     char Proto[8] = "http", Host[256] = {0}, BasePath[512] = "/";
     int  Port = 80;
     char *Sl = strstr(Url, "://");
-    if (Sl) {
-        size_t PL = (size_t)(Sl - Url); if (PL < 8) { memcpy(Proto, Url, PL); Proto[PL] = '\0'; }
-        Sl += 3;
-    } else Sl = Url;
-    if (strcasecmp(Proto, "https") == 0) Port = 443;
+    if (Sl) { size_t PL=(size_t)(Sl-Url); if(PL<8){memcpy(Proto,Url,PL);Proto[PL]='\0';} Sl+=3; } else Sl=Url;
+    if (strcasecmp(Proto,"https")==0) Port=443;
     char *PS = strchr(Sl, '/');
-    if (PS) {
-        snprintf(BasePath, sizeof(BasePath), "%s", PS);
-        size_t HL = (size_t)(PS - Sl); if (HL >= sizeof(Host)) HL = sizeof(Host) - 1;
-        memcpy(Host, Sl, HL); Host[HL] = '\0';
-    } else {
-        snprintf(Host, sizeof(Host), "%.*s", (int)(sizeof(Host) - 1), Sl);
+    if (PS) { snprintf(BasePath,sizeof(BasePath),"%s",PS); size_t HL=(size_t)(PS-Sl); if(HL>=sizeof(Host))HL=sizeof(Host)-1; memcpy(Host,Sl,HL); Host[HL]='\0'; }
+    else    { snprintf(Host,sizeof(Host),"%.*s",(int)(sizeof(Host)-1),Sl); }
+    char *CP = strchr(Host,':'); if(CP){Port=atoi(CP+1);*CP='\0';}
+    if (ForcePort>0) {
+        Port=ForcePort;
+        if (Port==443) snprintf(Proto,sizeof(Proto),"https");
+        else if (Port==80 && strcasecmp(Proto,"https")!=0) snprintf(Proto,sizeof(Proto),"http");
     }
-    char *CP = strchr(Host, ':'); if (CP) { Port = atoi(CP + 1); *CP = '\0'; }
-    if (BasePath[strlen(BasePath) - 1] != '/') strncat(BasePath, "/", sizeof(BasePath) - strlen(BasePath) - 1);
+    if (BasePath[strlen(BasePath)-1]!='/') strncat(BasePath,"/",sizeof(BasePath)-strlen(BasePath)-1);
 
-    char IP[64] = {0}; ResolveStr(Host, IP, sizeof(IP));
+    char IP[64]={0}; ResolveStr(Host,IP,sizeof(IP));
 
     printf("\n  %s%sDIR DISCOVERY%s\n", BD, CGreen, CR);
-    printf("  %s%starget%s   %s%s%s://%s:%d%s%s%s\n", BD, CDim, CR, BD, CWhite, Proto, Host, Port, BasePath, CR, "");
-    if (IP[0]) printf("  %s%sip%s       %s%s%s%s\n", BD, CDim, CR, BD, CBlue, IP, CR);
+    printf("  %s%starget%s   %s%s%s://%s:%d%s%s\n", BD,CDim,CR,BD,CWhite,Proto,Host,Port,BasePath,CR);
+    if (IP[0]) printf("  %s%sip%s       %s%s%s%s\n", BD,CDim,CR,BD,CBlue,IP,CR);
     printf("  %s%sdepth%s    %s%s%d%s  %s%sthreads%s %s%s%d%s  %s%stimeout%s %s%s%ds%s\n\n",
-        BD, CDim, CR, BD, CWhite, Depth, CR,
-        BD, CDim, CR, BD, CWhite, Threads, CR,
-        BD, CDim, CR, BD, CWhite, Timeout, CR);
+        BD,CDim,CR,BD,CWhite,Depth,CR, BD,CDim,CR,BD,CWhite,Threads,CR, BD,CDim,CR,BD,CWhite,Timeout,CR);
 
-    char **Words = NULL; int WordCount = 0; int WordMalloc = 0;
+    char **Words=NULL; int WordCount=0; int WordMalloc=0;
     if (WordlistFile[0]) {
-        FILE *Fp = fopen(WordlistFile, "r");
-        if (!Fp) { fprintf(stderr, "  %s%s[ERR]%s Cannot open: %s\n\n", BD, CRed, CR, WordlistFile); return; }
-        int Cap = 4096;
-        Words = (char **)malloc(sizeof(char *) * Cap);
-        char Line[256];
-        while (fgets(Line, sizeof(Line), Fp)) {
-            TrimLine(Line); if (!Line[0] || Line[0] == '#') continue;
-            if (WordCount >= Cap) { Cap *= 2; Words = (char **)realloc(Words, sizeof(char *) * Cap); }
-            Words[WordCount++] = strdup(Line);
-        }
-        fclose(Fp); WordMalloc = 1;
-        printf("  %s%s[+]%s Loaded %s%d%s words from %s%s%s\n\n", BD, CGreen, CR, BD, WordCount, CR, CDim, WordlistFile, CR);
+        FILE *Fp=fopen(WordlistFile,"r");
+        if (!Fp){fprintf(stderr,"  %s%s[ERR]%s Cannot open: %s\n\n",BD,CRed,CR,WordlistFile);return;}
+        int Cap=4096; Words=(char**)malloc(sizeof(char*)*Cap); char Line[256];
+        while(fgets(Line,sizeof(Line),Fp)){TrimLine(Line);if(!Line[0]||Line[0]=='#')continue;if(WordCount>=Cap){Cap*=2;Words=(char**)realloc(Words,sizeof(char*)*Cap);}Words[WordCount++]=strdup(Line);}
+        fclose(Fp); WordMalloc=1;
+        printf("  %s%s[+]%s Loaded %s%d%s words from %s%s%s\n\n",BD,CGreen,CR,BD,WordCount,CR,CDim,WordlistFile,CR);
     } else {
-        while (DirWordlist[WordCount]) WordCount++;
-        Words = (char **)DirWordlist;
-        printf("  %s%s[+]%s Built-in wordlist %s(%d paths)%s\n\n", BD, CGreen, CR, CDim, WordCount, CR);
+        while(DirWordlist[WordCount])WordCount++;
+        Words=(char**)DirWordlist;
+        printf("  %s%s[+]%s Built-in wordlist %s(%d paths)%s\n\n",BD,CGreen,CR,CDim,WordCount,CR);
     }
 
-    int MaxRes = WordCount * Depth + 1;
-    DirResult *Results = (DirResult *)calloc(MaxRes, sizeof(DirResult));
-    pthread_mutex_t Lock = PTHREAD_MUTEX_INITIALIZER;
-    volatile int DirDone = 0, DirFound = 0;
+    int AllFound = 0;
+    int AllMax   = WordCount * Depth * 4 + 256;
+    DirResult *AllResults = (DirResult *)calloc(AllMax, sizeof(DirResult));
 
-    char *CurrentPaths[8]; int PathCount = 0;
-    CurrentPaths[PathCount++] = strdup(BasePath);
+    char *ActivePaths[128];
+    int   ActivePathCount = 1;
+    ActivePaths[0] = strdup(BasePath);
 
     for (int D = 0; D < Depth && Running; D++) {
-        if (PathCount == 0) break;
-        char *ScanPath = CurrentPaths[0];
+        if (ActivePathCount == 0) break;
 
-        printf("  %s%s[depth %d]%s  %s%s%s\n\n", BD, CDim, D + 1, CR, CDim, ScanPath, CR);
-        DirDone = 0;
+        char **NextPaths = (char **)calloc(ActivePathCount * WordCount + 1, sizeof(char*));
+        int   NextCount  = 0;
+        int   DepthFound = 0;
 
-        pthread_t *Thr = (pthread_t *)malloc(sizeof(pthread_t) * WordCount);
-        int Launched = 0, Active = 0;
+        for (int PathIdx = 0; PathIdx < ActivePathCount && Running; PathIdx++) {
+            char *ScanPath = ActivePaths[PathIdx];
+            printf("  %s%s[depth %d/%d]%s  %s%s%s\n\n",
+                BD,CDim,D+1,Depth,CR,CDim,ScanPath,CR);
 
-        for (int i = 0; i < WordCount && Running; i++) {
-            while (Active >= Threads) {
-                usleep(3000);
-                pthread_mutex_lock(&Lock);
-                Active = Launched - DirDone;
-                pthread_mutex_unlock(&Lock);
+            int    LocalMax     = WordCount + 4;
+            DirResult *LocalRes = (DirResult *)calloc(LocalMax, sizeof(DirResult));
+            volatile int LocDone = 0, LocFound = 0;
+            pthread_mutex_t Lock = PTHREAD_MUTEX_INITIALIZER;
+
+            pthread_t *Thr=(pthread_t*)malloc(sizeof(pthread_t)*WordCount);
+            int Launched=0, Active=0;
+
+            for (int i=0; i<WordCount && Running; i++) {
+                while (Active>=Threads) {
+                    usleep(3000);
+                    pthread_mutex_lock(&Lock);
+                    Active=Launched-LocDone;
+                    pthread_mutex_unlock(&Lock);
+                }
+                DirWorkerArg *WA=(DirWorkerArg*)malloc(sizeof(DirWorkerArg));
+                snprintf(WA->Host,    sizeof(WA->Host),    "%s", Host);
+                snprintf(WA->Proto,   sizeof(WA->Proto),   "%s", Proto);
+                snprintf(WA->BasePath,sizeof(WA->BasePath),"%s", ScanPath);
+                WA->Port     = Port;
+                WA->Word     = Words[i];
+                WA->Timeout  = Timeout;
+                WA->Results  = LocalRes;
+                WA->Lock     = &Lock;
+                WA->DoneRef  = &LocDone;
+                WA->FoundRef = &LocFound;
+                pthread_create(&Thr[Launched],NULL,DirWorker,WA);
+                Launched++; Active++;
+
+                pthread_mutex_lock(&Lock); int Dn=LocDone; pthread_mutex_unlock(&Lock);
+                float Pct=(float)Dn*100.0f/(float)WordCount;
+                printf("\r  %s%s[%s",BD,CDim,CR);
+                int BW=26;
+                for(int b=0;b<BW;b++) printf(b<(int)(Pct/100.0f*BW)?"%s%s█%s":"%s▒%s",(b<(int)(Pct/100.0f*BW)?BD:""),CGreen,CR);
+                printf("%s%s]%s %s%s%5.1f%%%s  %s%s%d/%d%s  %s%s+%d%s",BD,CDim,CR,BD,CWhite,Pct,CR,CDim,BD,Dn,WordCount,CR,BD,CGreen,LocFound,CR);
+                fflush(stdout);
             }
-            DirWorkerArg *WA = (DirWorkerArg *)malloc(sizeof(DirWorkerArg));
-            snprintf(WA->Host,     sizeof(WA->Host),     "%s", Host);
-            snprintf(WA->Proto,    sizeof(WA->Proto),    "%s", Proto);
-            snprintf(WA->BasePath, sizeof(WA->BasePath), "%s", ScanPath);
-            WA->Port    = Port;
-            WA->Word    = Words[i];
-            WA->Timeout = Timeout;
-            WA->Results = Results;
-            WA->Lock    = &Lock;
-            WA->DoneRef = &DirDone;
-            WA->FoundRef= &DirFound;
-            pthread_create(&Thr[Launched], NULL, DirWorker, WA);
-            Launched++; Active++;
 
-            pthread_mutex_lock(&Lock);
-            int Dn = DirDone, Fn = DirFound;
-            pthread_mutex_unlock(&Lock);
-            float Pct = (float)Dn * 100.0f / (float)WordCount;
-            printf("\r  %s%s[%s", BD, CDim, CR);
-            int BW = 26;
-            for (int b = 0; b < BW; b++)
-                printf(b < (int)(Pct / 100.0f * BW) ? "%s%s█%s" : "%s▒%s",
-                    (b < (int)(Pct / 100.0f * BW) ? BD : ""), CGreen, CR);
-            printf("%s%s]%s %s%s%5.1f%%%s  %s%s%d/%d%s  %s%sfound: %d%s",
-                BD, CDim, CR, BD, CWhite, Pct, CR,
-                CDim, BD, Dn, WordCount, CR,
-                BD, CGreen, Fn, CR);
-            fflush(stdout);
+            for (int i=0; i<Launched; i++) pthread_join(Thr[i],NULL);
+            free(Thr);
+            printf("\r%80s\r","");
+            pthread_mutex_destroy(&Lock);
+            free(ScanPath);
+
+            for (int r=0; r<LocFound; r++) {
+                if (AllFound < AllMax-1) {
+                    AllResults[AllFound++] = LocalRes[r];
+                }
+                if (D < Depth-1 && NextCount < 256 &&
+                    LocalRes[r].StatusCode>=200 && LocalRes[r].StatusCode<400 &&
+                    !strchr(LocalRes[r].Path+1,'.')) {
+                    char *NP=(char*)malloc(512);
+                    snprintf(NP,512,"%s/",LocalRes[r].Path);
+                    NextPaths[NextCount++]=NP;
+                }
+            }
+            DepthFound += LocFound;
+            free(LocalRes);
         }
+        free(ActivePaths[0]);
+        ActivePathCount=0;
 
-        for (int i = 0; i < Launched; i++) pthread_join(Thr[i], NULL);
-        free(Thr);
-        printf("\r%80s\r", "");
-        free(ScanPath);
-        PathCount = 0;
+        for (int i=0; i<NextCount && i<128; i++) ActivePaths[ActivePathCount++]=NextPaths[i];
+        free(NextPaths);
+        (void)DepthFound;
     }
 
-    int TotalFound = DirFound;
-    printf("  %s%sDIR RESULTS%s  %s%s%s://%s:%d%s\n\n",
-        BD, CGreen, CR, BD, CWhite, Proto, Host, Port, CR);
+    printf("  %s%sDIR RESULTS%s  %s%s%s://%s:%d%s\n\n",BD,CGreen,CR,BD,CWhite,Proto,Host,Port,CR);
 
-    for (int i = 0; i < TotalFound; i++) {
-        DirResult *R = &Results[i];
-        if (!ShowAll && R->StatusCode >= 400 && R->StatusCode < 500) continue;
-        const char *SC = StatusColor(R->StatusCode);
-        printf("  %s%s[%d]%s  %s%s%s%s",
-            BD, SC, R->StatusCode, CR,
-            BD, CGreen, R->Path, CR);
-        if (R->Location[0])
-            printf("  %s%s→ %s%s", CDim, BD, R->Location, CR);
-        printf("\n");
+    int Shown=0, Accessible=0;
+    for (int i=0; i<AllFound; i++) {
+        DirResult *R=&AllResults[i];
+        if (!ShowAll && R->StatusCode>=400) continue;
+        const char *SC=StatusColor(R->StatusCode);
+        printf("  %s%s[%d]%s  %s%s%s%s",BD,SC,R->StatusCode,CR,BD,CGreen,R->Path,CR);
+        if (R->Location[0]) printf("  %s%s→ %s%s",CDim,BD,R->Location,CR);
+        printf("\n"); Shown++;
+        if (R->StatusCode>=200 && R->StatusCode<400) Accessible++;
     }
 
-    if (TotalFound == 0 || (!ShowAll && TotalFound > 0)) {
-        int Shown = 0;
-        for (int i = 0; i < TotalFound; i++) {
-            DirResult *R = &Results[i];
-            if (R->StatusCode >= 200 && R->StatusCode < 400) Shown++;
-        }
-        if (Shown == 0 && !ShowAll)
-            printf("  %s%sNo accessible paths found. Try -a to show 4xx.%s\n", CDim, BD, CR);
-    }
+    if (Shown==0) printf("  %s%sNo paths found. Try -a to show 4xx.%s\n",CDim,BD,CR);
 
-    printf("\n  %s%schecked%s %s%s%d%s  %s%sfound%s %s%s%d%s  %s%sdepth%s %s%s%d%s\n\n",
-        BD, CDim, CR, BD, CWhite, WordCount * Depth, CR,
-        BD, CDim, CR, BD, CGreen, TotalFound, CR,
-        BD, CDim, CR, BD, CWhite, Depth, CR);
+    printf("\n  %s%schecked%s %s%s%d%s  %s%sfound%s %s%s%d%s  %s%saccessible%s %s%s%d%s\n\n",
+        BD,CDim,CR,BD,CWhite,WordCount*Depth,CR,
+        BD,CDim,CR,BD,CGreen,AllFound,CR,
+        BD,CDim,CR,BD,CGreen,Accessible,CR);
 
-    free(Results);
-    pthread_mutex_destroy(&Lock);
-    if (WordMalloc) { for (int i = 0; i < WordCount; i++) free(Words[i]); free(Words); }
+    free(AllResults);
+    if (WordMalloc){for(int i=0;i<WordCount;i++)free(Words[i]);free(Words);}
 }
+
 
 int main(int Argc, char **Argv) {
     signal(SIGINT,SigHandler);signal(SIGTERM,SigHandler);
