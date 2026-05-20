@@ -16,7 +16,7 @@ cd HTONSpider
 ### Compile
 
 ```bash
-gcc -O2 -Wall -o htonspider htonspider.c -lpthread -lm
+gcc -O2 -Wall -DHAVE_SSL -o htonspider htonspider.c -lpthread -lm -lssl -lcrypto
 ```
 
 ### Usage Example
