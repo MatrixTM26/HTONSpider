@@ -1,12 +1,12 @@
 <div align="center">
-    <img src="images/logo.png" width="300px" height="auto" alt="TOMCAT-C2 Logo" >
+    <img src="images/logo.png" width="300px" height="auto" alt="HTONSpider Logo">
 </div>
 
-A networking toolkit for analize, trace, and filter active proxies
+A full network recon & security scanner — port scan, DNS trace, subdomain discovery, ARP sweep, proxy filter, path enumeration, and CVE detection in one tool
 
 ---
 
-### Installation and Usage
+## <img src="https://cdn.simpleicons.org/gnubash/ff0000" width="18"> Installation & Usage
 
 ```bash
 git clone https://github.com/MatrixTM26/HTONSpider.git
@@ -16,7 +16,7 @@ cd HTONSpider
 ### Compile
 
 ```bash
-gcc -O2 -Wall -DHAVE_SSL -o htonspider htonspider.c -lpthread -lm -lssl -lcrypto
+go build -o htonspider .
 ```
 
 ### Usage Example
@@ -27,96 +27,122 @@ gcc -O2 -Wall -DHAVE_SSL -o htonspider htonspider.c -lpthread -lm -lssl -lcrypto
 ./htonspider -h
 ```
 
+**Port Scan**
+
 ```bash
-./htonspider <module> [option]
+./htonspider -m port -s example.com
 ```
 
 ```bash
-./htonspider sub -h
-```
-
-**Proxy Check**
-
-```bash
-./htonspider -L Proxies.txt -P auto -E -F alive -T 1000 -v -t 5
+./htonspider -m port -s example.com -p 1-1024 -b -T 300 -t 500 -e scan.txt
 ```
 
 ```bash
-./htonspider -s google.com -P <socket type: AUTO | HTTP | SOCKS4 | SOCKS5> -E <export filename> -F <filter type: alive | dead> -T <thread count> -v <verbose> -t <timeout>
+./htonspider -m port -s example.com -p all -U -T 500 -t 400
 ```
 
-**DNS Record Check**
+**DNS Resolve & Trace**
 
 ```bash
-./htonspider dns google.com -s 1.1.1.1
-```
-
-**Ping**
-
-```bash
-./htonspider ping google.com
-```
-
-**Trace**
-
-```bash
-./htonspider trace google.com
-```
-
-**Whois**
-
-```bash
-./htonspider whois google.com
-```
-
-**Subnet**
-
-```bash
-./htonspider subnet 172.0.0.0/24
-```
-
-**Subdomain Finder**
-
-```bash
-./htonspider sub -t example.com
+./htonspider -m dns -s example.com
 ```
 
 ```bash
-./htonspider sub -t example.com -H -p 443 -F alive -T 1000
+./htonspider -m dns -s example.com -e dns.txt
+```
+
+**Subdomain Discovery**
+
+```bash
+./htonspider -m sub -s example.com
 ```
 
 ```bash
-./htonspider sub -t example.com -H -p 443 -F alive -w wordlist/subdomain/default.txt -T 1000
+./htonspider -m sub -s example.com -W wordlist.txt -T 50 -e subdomains.txt
 ```
 
-**Directory Brute Forcing**
+**ARP Network Scan**
 
 ```bash
-./htonspider dir -u example.com
-```
-
-```bash
-./htonspider dir -u example.com -D 3 -T 1000 -t 5
+./htonspider -m arp -s 192.168.1.0/24
 ```
 
 ```bash
-./htonspider dir -u example.com -D 3 -T 1000 -t 5 -w wordlist/directories/default.txt
+./htonspider -m arp -s 192.168.1.0/24 -T 100 -e hosts.txt
+```
+
+**Proxy / IP Checker**
+
+```bash
+./htonspider -m proxy -s proxies.txt -A -e alive.txt
+```
+
+```bash
+./htonspider -m proxy -s 103.10.1.1:8080,103.10.1.2:3128 -T 50 -t 5000
+```
+
+**Path & File Discovery**
+
+```bash
+./htonspider -m path -s https://example.com
+```
+
+```bash
+./htonspider -m path -s https://example.com -W paths.txt -T 30 -e found.txt
+```
+
+**Service & Vulnerability Detection**
+
+```bash
+./htonspider -m vuln -s example.com
+```
+
+```bash
+./htonspider -m vuln -s example.com -p 80,443,22,3306 -e report.txt
+```
+
+**Full Scan**
+
+```bash
+./htonspider -m full -s example.com
+```
+
+```bash
+./htonspider -m full -s example.com -W wordlist.txt -p 1-1024 -T 200 -V -e full.txt
 ```
 
 ---
 
-<div align="left">
+## <img src="https://cdn.simpleicons.org/socket/ff0000" width="18"> Command line argument
 
-## ◈ Support Me
-
-If this project helps, you can support me here:
-
-[![Ko-fi](https://img.shields.io/badge/KO--FI-000000?style=for-the-badge&logo=kofi&logoColor=ff5f5f)](https://ko-fi.com/MatrixTM26)
-[![Trakteer](https://img.shields.io/badge/TRAKTEER-000000?style=for-the-badge&logo=buymeacoffee&logoColor=ff4444)](https://trakteer.id/MatrixTM26)
-[![PayPal](https://img.shields.io/badge/PAYPAL-000000?style=for-the-badge&logo=paypal&logoColor=00a2ff)](https://paypal.me/TeukuMaulana)
-
-</div>
+| Flag | Value    | Description                                                      |
+| ---- | -------- | ---------------------------------------------------------------- |
+| `-m` | `mode`   | Scan mode: `port` `dns` `sub` `arp` `proxy` `path` `vuln` `full` |
+| `-s` | `target` | Host, IP, CIDR, comma-list, or file path                         |
+| `-p` | `range`  | Port range: `80,443` \| `1-1024` \| `all` \| `common`            |
+| `-t` | `ms`     | Timeout in milliseconds (default: `800`)                         |
+| `-T` | `n`      | Concurrent threads (default: `200`)                              |
+| `-W` | `file`   | Wordlist file for subdomain or path discovery                    |
+| `-e` | `file`   | Export results to file                                           |
+| `-A` |          | Alive-only export (proxy mode)                                   |
+| `-U` |          | Also run UDP scan alongside TCP                                  |
+| `-b` |          | Grab service banners                                             |
+| `-V` |          | Verbose / debug output                                           |
+| `-n` |          | Skip ASCII banner                                                |
 
 ---
 
-<p align="center">&copy; 2023-2026 MatrixTM26</p>
+## <img src="https://cdn.simpleicons.org/github/ff0000" width="18"> Credit
+
+- **Author:** [@MatrixTM26](https://github.com/MatrixTM26)
+- **License:** [AGPL-V3](./LICENSE)
+
+## <img src="https://cdn.simpleicons.org/githubsponsors/ff0000" width="18"> Support Me
+
+[![Ko-fi](https://img.shields.io/badge/KO--FI-000000?style=for-the-badge&logo=kofi&logoColor=fff707)](https://ko-fi.com/MatrixTM26)
+[![Trakteer](https://img.shields.io/badge/TRAKTEER-000000?style=for-the-badge&logo=buymeacoffee&logoColor=ff6a6a)](https://trakteer.id/MatrixTM26)
+[![PayPal](https://img.shields.io/badge/PAYPAL-000000?style=for-the-badge&logo=paypal&logoColor=0000ff)](https://paypal.me/TeukuMaulana)
+
+---
+
+<p align="center">Copyright &copy;2023-2026 MatrixTM26 &middot; All Rights Reserved</p>
